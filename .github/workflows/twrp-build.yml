@@ -13,8 +13,11 @@
 #      (both were hard lessons from the local build attempts).
 #   3. repo init/sync the minimal TWRP 12.1 manifest (shallow, -c).
 #   4. Clones the X6850 device tree + mt6789-common at pinned branches.
-#   5. Applies the approved vendorsetup.sh non-interactive patch (2 lines,
-#      byte-identical to the local build host; shown via git diff in the log).
+#   5. Applies the approved vendorsetup.sh patches: (1) non-interactive device
+#      detection (2 lines, byte-identical to the local build host);
+#      (2) idempotent external/gflags clone (the minimal manifest already
+#      syncs it, so the unconditional clone would fail under `bash -e`).
+#      Both shown via git diff in the log.
 #   6. lunch twrp_X6850-eng && mka --skip-soong-tests adbd vendorbootimage
 #      (--skip-soong-tests skips upstream Soong Go unit tests; verified working
 #      locally and does not change the produced image).
@@ -109,23 +112,45 @@ jobs:
           git -C device/infinix/Infinix-X6850 log --oneline -1
           git -C device/transsion/mt6789-common log --oneline -1
 
-      - name: Apply vendorsetup.sh non-interactive patch
+      - name: Apply vendorsetup.sh patches
+        # Patch 1 (approved): allow non-interactive sourcing when the device is
+        #   detected via script path (fixes "couldn't detect the device" exit).
+        # Patch 2 (approved 2026-11-02): make the external/gflags clone conditional.
+        #   The minimal manifest already syncs external/gflags, so the unconditional
+        #   `git clone` fails with exit 128 ("already exists"), which kills the step
+        #   under GitHub Actions' default `bash -e`.
         run: |
           cd "$BUILD_DIR"
           python3 << 'PYEOF'
           p = 'device/infinix/Infinix-X6850/vendorsetup.sh'
           s = open(p).read()
-          marker = 'continuing in non-interactive mode'
-          if marker in s:
-              print('patch already present, skipping')
+
+          # Patch 1: non-interactive device detection
+          marker1 = 'continuing in non-interactive mode'
+          if marker1 in s:
+              print('patch 1 already present, skipping')
           else:
               anchor = '\t\t\techo "NOTE: Running in ZSH mode"\n'
-              assert anchor in s, 'anchor line not found - device tree may have changed!'
+              assert anchor in s, 'patch 1 anchor not found - device tree may have changed!'
               ins = ('\t\telif [ "$FOX_BUILD_DEVICE" = "$FDEVICE" ]; then\n'
                      '\t\t\techo "NOTE: Device $FDEVICE detected via script path; continuing in non-interactive mode"\n')
               s = s.replace(anchor, anchor + ins, 1)
-              open(p, 'w').write(s)
-              print('patch applied')
+              print('patch 1 applied')
+
+          # Patch 2: idempotent gflags clone
+          marker2 = 'if [ ! -d external/gflags ]; then'
+          if marker2 in s:
+              print('patch 2 already present, skipping')
+          else:
+              old = '\tgit clone https://android.googlesource.com/platform/external/gflags/ -b android-12.1.0_r4 external/gflags\n'
+              assert old in s, 'patch 2 anchor not found - device tree may have changed!'
+              new = ('\tif [ ! -d external/gflags ]; then\n'
+                     '\t\tgit clone https://android.googlesource.com/platform/external/gflags/ -b android-12.1.0_r4 external/gflags\n'
+                     '\tfi\n')
+              s = s.replace(old, new, 1)
+              print('patch 2 applied')
+
+          open(p, 'w').write(s)
           PYEOF
           git -C device/infinix/Infinix-X6850 diff -- vendorsetup.sh
 
