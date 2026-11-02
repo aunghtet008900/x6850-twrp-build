@@ -1,0 +1,158 @@
+# X6850 TWRP Recovery — cloud build on GitHub Actions
+#
+# UNTESTED DRAFT. Modeled on community OrangeFox/TWRP builder workflows and the
+# exact commands verified on the local VM (4 build attempts, 2026-11-01).
+# Review before running.
+#
+# What it does:
+#   1. Frees disk on the runner. Standard runners ship with only ~14 GB free,
+#      NOT enough for the ~46 GB synced tree. Removing preinstalled bloat
+#      (dotnet, android SDK, ghc, CodeQL, docker images) typically leaves
+#      50+ GB free. df -h is printed before/after so you can verify in the log.
+#   2. Installs AOSP 12.1 build deps, incl. python-is-python3 and OpenJDK 11
+#      (both were hard lessons from the local build attempts).
+#   3. repo init/sync the minimal TWRP 12.1 manifest (shallow, -c).
+#   4. Clones the X6850 device tree + mt6789-common at pinned branches.
+#   5. Applies the approved vendorsetup.sh non-interactive patch (2 lines,
+#      byte-identical to the local build host; shown via git diff in the log).
+#   6. lunch twrp_X6850-eng && mka --skip-soong-tests adbd vendorbootimage
+#      (--skip-soong-tests skips upstream Soong Go unit tests; verified working
+#      locally and does not change the produced image).
+#   7. Uploads vendor_boot.img + sha256 as an artifact.
+#
+# Runner (public repo): 4 vCPU / 16 GB RAM — clears the ~7.4 GB soong_build
+# peak that OOM-killed the 7.7 GB local VM, with headroom. 6 h job limit.
+# Public repo recommended: standard runners are free/unlimited on public
+# repos and this build needs no secrets.
+#
+# To use: create a PUBLIC repo (e.g. x6850-twrp-build), place this file at
+# .github/workflows/twrp-build.yml, then Actions tab -> "X6850 TWRP Recovery
+# Build" -> Run workflow.
+
+name: X6850 TWRP Recovery Build
+
+on:
+  workflow_dispatch:  # manual trigger from the Actions tab
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  BUILD_DIR: /home/runner/twrp-build
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04  # pinned; 22.04 carries the Java 11 / py3.10 stack AOSP 12.1 expects
+    timeout-minutes: 360    # GitHub hard limit is 6 h per job
+    steps:
+      - name: Show runner resources
+        run: |
+          echo "CPUs: $(nproc)"
+          free -h
+          df -h
+
+      - name: Free up disk space
+        run: |
+          echo "=== BEFORE ==="; df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-/nonexistent}" || true
+          sudo docker image prune --all --force || true
+          sudo apt-get clean
+          echo "=== AFTER ==="; df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex \
+            g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick \
+            lib32ncurses5-dev lib32readline-dev lib32z1-dev libelf-dev \
+            liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev \
+            libxml2 libxml2-utils lzop pngcrush python-is-python3 rsync \
+            schedtool squashfs-tools xsltproc zip zlib1g-dev openjdk-11-jdk
+          python --version
+          java -version 2>&1 | head -3
+
+      - name: Install repo tool
+        run: |
+          mkdir -p ~/bin
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+          git config --global user.name "x6850-builder"
+          git config --global user.email "x6850-builder@localhost"
+          git config --global color.ui false
+          ~/bin/repo --version
+
+      - name: Sync minimal TWRP manifest
+        run: |
+          mkdir -p "$BUILD_DIR" && cd "$BUILD_DIR"
+          ~/bin/repo init -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git \
+            -b twrp-12.1 --depth=1
+          ~/bin/repo sync -c -j"$(nproc --all)" --no-tags --no-clone-bundle
+          echo "=== tree size ==="; du -sh "$BUILD_DIR"
+          echo "=== disk ==="; df -h "$BUILD_DIR" | tail -1
+
+      - name: Clone device trees
+        run: |
+          cd "$BUILD_DIR"
+          git clone --depth 1 -b fox_12.1-xos15 \
+            https://github.com/transsion-mt6789-recovery/twrp-device_infinix_Infinix-X6850.git \
+            device/infinix/Infinix-X6850
+          git clone --depth 1 -b fox_12.1-tranos15 \
+            https://github.com/transsion-mt6789-recovery/twrp-device_transsion_mt6789-common.git \
+            device/transsion/mt6789-common
+          git -C device/infinix/Infinix-X6850 log --oneline -1
+          git -C device/transsion/mt6789-common log --oneline -1
+
+      - name: Apply vendorsetup.sh non-interactive patch
+        run: |
+          cd "$BUILD_DIR"
+          python3 << 'PYEOF'
+          p = 'device/infinix/Infinix-X6850/vendorsetup.sh'
+          s = open(p).read()
+          marker = 'continuing in non-interactive mode'
+          if marker in s:
+              print('patch already present, skipping')
+          else:
+              anchor = '\t\t\techo "NOTE: Running in ZSH mode"\n'
+              assert anchor in s, 'anchor line not found - device tree may have changed!'
+              ins = ('\t\telif [ "$FOX_BUILD_DEVICE" = "$FDEVICE" ]; then\n'
+                     '\t\t\techo "NOTE: Device $FDEVICE detected via script path; continuing in non-interactive mode"\n')
+              s = s.replace(anchor, anchor + ins, 1)
+              open(p, 'w').write(s)
+              print('patch applied')
+          PYEOF
+          git -C device/infinix/Infinix-X6850 diff -- vendorsetup.sh
+
+      - name: Build vendor_boot image
+        run: |
+          set -euo pipefail
+          cd "$BUILD_DIR"
+          source build/envsetup.sh
+          lunch twrp_X6850-eng
+          mka -j"$(nproc --all)" --skip-soong-tests adbd vendorbootimage 2>&1 | tee build_gha.log
+          echo "=== output ==="
+          ls -lh out/target/product/Infinix-X6850/vendor_boot.img
+          ( cd out/target/product/Infinix-X6850 && sha256sum vendor_boot.img | tee "$BUILD_DIR/vendor_boot.img.sha256" )
+
+      - name: Upload vendor_boot image
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: X6850-vendor_boot
+          path: |
+            ${{ env.BUILD_DIR }}/out/target/product/Infinix-X6850/vendor_boot.img
+            ${{ env.BUILD_DIR }}/vendor_boot.img.sha256
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ env.BUILD_DIR }}/build_gha.log
