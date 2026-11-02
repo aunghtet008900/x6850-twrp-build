@@ -129,13 +129,19 @@ jobs:
           PYEOF
           git -C device/infinix/Infinix-X6850 diff -- vendorsetup.sh
 
-      - name: Build vendor_boot image
+            - name: Build vendor_boot image
+        # NOTE: do NOT use `set -u` (nounset) in this step. build/envsetup.sh
+        # is not nounset-clean: it references $TOP before it is set, which
+        # aborts the shell under `set -u` (this killed CI run #1).
         run: |
-          set -euo pipefail
           cd "$BUILD_DIR"
           source build/envsetup.sh
           lunch twrp_X6850-eng
-          mka -j"$(nproc --all)" --skip-soong-tests adbd vendorbootimage 2>&1 | tee build_gha.log
+          set -o pipefail
+          if ! mka -j"$(nproc --all)" --skip-soong-tests adbd vendorbootimage 2>&1 | tee build_gha.log; then
+            echo "ERROR: mka failed"
+            exit 1
+          fi
           echo "=== output ==="
           ls -lh out/target/product/Infinix-X6850/vendor_boot.img
           ( cd out/target/product/Infinix-X6850 && sha256sum vendor_boot.img | tee "$BUILD_DIR/vendor_boot.img.sha256" )
