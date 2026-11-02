@@ -129,7 +129,7 @@ jobs:
           PYEOF
           git -C device/infinix/Infinix-X6850 diff -- vendorsetup.sh
 
-            - name: Build vendor_boot image
+      - name: Build vendor_boot image
         # NOTE: do NOT use `set -u` (nounset) in this step. build/envsetup.sh
         # is not nounset-clean: it references $TOP before it is set, which
         # aborts the shell under `set -u` (this killed CI run #1).
